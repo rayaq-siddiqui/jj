@@ -2004,13 +2004,13 @@ fn test_fix_with_skip_clean() {
         command = [{formatter}, "--uppercase"]
         patterns = ["foo", "baz"]
         line-range-arg = "--line-ranges=$start-$end"
-        skip-clean = false
+        skip-unchanged-files = false
 
         [fix.tools.tool-2]
         command = [{formatter}, "--lowercase"]
         patterns = ["bar"]
         line-range-arg = "--line-ranges=$start-$end"
-        skip-clean = true
+        skip-unchanged-files = true
         "###,
     ));
 
@@ -2130,9 +2130,9 @@ fn test_fix_with_all_lines_arg() {
     insta::assert_snapshot!(output, @r"
     ------- stderr -------
     Fixed 2 commits of 2 checked.
-    Working copy  (@) now at: mzvwutvl 82aeefb1 (empty) (no description set)
-    Parent commit (@-)      : kkmpptxz 683a90ad c2 | (no description set)
-    Added 0 files, modified 1 files, removed 0 files
+    Working copy  (@) now at: mzvwutvl c9b70b48 (empty) (no description set)
+    Parent commit (@-)      : kkmpptxz cff7e0ed c2 | (no description set)
+    Added 0 files, modified 2 files, removed 0 files
     [EOF]
     ");
 
@@ -2177,6 +2177,241 @@ fn test_fix_with_all_lines_arg() {
     let output = work_dir.run_jj(["file", "show", "baz", "-r", "c2"]);
     insta::assert_snapshot!(output, @r"
     unmodified
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_fix_with_line_ranges_multiple_formatters() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    let formatter_path = assert_cmd::cargo::cargo_bin!("fake-formatter");
+    assert!(formatter_path.is_file());
+    let formatter = to_toml_value(formatter_path.to_str().unwrap());
+    test_env.add_config(format!(
+        r###"
+        [fix.tools.tool-1]
+        command = [{formatter}, "--split-even-lines"]
+        patterns = ["foo"]
+        line-range-arg = "--line-ranges=$start-$end"
+
+        [fix.tools.tool-2]
+        command = [{formatter}, "--uppercase"]
+        patterns = ["foo"]
+        line-range-arg = "--line-ranges=$start-$end"
+        "###,
+    ));
+
+    // Initial commit.
+    work_dir.write_file("foo", "ab\ncd\nefg\n");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "c1"])
+        .success();
+    work_dir.run_jj(["new"]).success();
+
+    // Create new commit to deal with split even lines and uppercase.
+    work_dir.write_file("foo", "abcd\nefgh\n");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "c2"])
+        .success();
+    work_dir.run_jj(["new"]).success();
+
+    // Run `jj fix` on the second commit.
+    let output = work_dir.run_jj(["fix", "-s", "c2"]).success();
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Fixed 2 commits of 2 checked.
+    Working copy  (@) now at: mzvwutvl ea416483 (empty) (no description set)
+    Parent commit (@-)      : kkmpptxz 6d58e0e3 c2 | (no description set)
+    Added 0 files, modified 1 files, removed 0 files
+    [EOF]
+    ");
+
+    // Check that the formatter was not applied to the first commit.
+    let output = work_dir.run_jj(["file", "show", "foo", "-r", "c1"]);
+    insta::assert_snapshot!(output, @r"
+    ab
+    cd
+    efg
+    [EOF]
+    ");
+
+    // Check that split lines was applied first and then upper was only applied to the second half.
+    let output = work_dir.run_jj(["file", "show", "foo", "-r", "c2"]);
+    insta::assert_snapshot!(output, @r"
+    ab
+    cd
+    EF
+    GH
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_fix_with_line_ranges_conflicted_base_commit() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    let formatter_path = assert_cmd::cargo::cargo_bin!("fake-formatter");
+    assert!(formatter_path.is_file());
+    let formatter = to_toml_value(formatter_path.to_str().unwrap());
+    test_env.add_config(format!(
+        r###"
+        [fix.tools.tool-1]
+        command = [{formatter}, "--uppercase"]
+        patterns = ["foo"]
+        line-range-arg = "--line-ranges=$start-$end"
+        "###,
+    ));
+
+    // Initial baseline commit.
+    work_dir.write_file("foo", "line1\nline2\nline3\n");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "c1"])
+        .success();
+    work_dir.run_jj(["new"]).success();
+
+    // Left side of the conflict.
+    work_dir.write_file("foo", "line1\nline2 left\nline3 change\n");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "c2"])
+        .success();
+    work_dir.run_jj(["new", "c1"]).success();
+
+    // Right side of the conflict.
+    work_dir.write_file("foo", "line1 change\nline2 right\nline3\n");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "c3"])
+        .success();
+    work_dir.run_jj(["new", "c1"]).success();
+
+    // The conflicted base commit.
+    work_dir.run_jj(["new", "c2", "c3"]).success();
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "c4"])
+        .success();
+
+    // The commit we actually run fix on.
+    work_dir.write_file("foo", "line1\nline2 resolved\nline3\n");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "c5"])
+        .success();
+
+    // Run `jj fix` on the c5 commit.
+    work_dir.run_jj(["fix", "-s", "c5"]).success();
+
+    // Check that split lines was applied with a conflicted base commit.
+    // The output can be either expected1 or expected2 depending on the order of the
+    // conflicted base commit.
+    let output = work_dir.run_jj(["file", "show", "foo", "-r", "c5"]);
+    insta::assert_snapshot!(output, @"
+    line1
+    LINE2 RESOLVED
+    LINE3
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_fix_with_line_ranges_conflicted_current_commit() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    let formatter_path = assert_cmd::cargo::cargo_bin!("fake-formatter");
+    assert!(formatter_path.is_file());
+    let formatter = to_toml_value(formatter_path.to_str().unwrap());
+    test_env.add_config(format!(
+        r###"
+        [fix.tools.tool-1]
+        command = [{formatter}, "--uppercase"]
+        patterns = ["foo"]
+        line-range-arg = "--line-ranges=$start-$end"
+        "###,
+    ));
+
+    // Initial baseline commit.
+    work_dir.write_file("foo", "line1\nline2\nline3\n");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "c1"])
+        .success();
+    work_dir.run_jj(["new"]).success();
+
+    // Left side of the conflict.
+    work_dir.write_file("foo", "line1\nline2 left\nline3 change\n");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "c2"])
+        .success();
+    work_dir.run_jj(["new", "c1"]).success();
+
+    // Right side of the conflict.
+    work_dir.write_file("foo", "line1 change\nline2 right\nline3\n");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "c3"])
+        .success();
+    work_dir.run_jj(["new", "c1"]).success();
+
+    // The conflicted base commit that we run fix on.
+    work_dir.run_jj(["new", "c2", "c3"]).success();
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "c4"])
+        .success();
+
+    // Commit on top of the conflicted commit that we also run fix on.
+    work_dir.run_jj(["new", "c4"]).success();
+    work_dir.write_file("foo", "line1\nline2\nline3\n");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "c5"])
+        .success();
+
+    // show the conflict before the formatter
+    let output = work_dir.run_jj(["file", "show", "foo", "-r", "c4"]);
+    insta::assert_snapshot!(output, @r"
+    <<<<<<< conflict 1 of 1
+    %%%%%%% diff from: qpvuntsm fbc9da05
+    \\\\\\\        to: kkmpptxz 6cf9e9db
+     line1
+    -line2
+    -line3
+    +line2 left
+    +line3 change
+    +++++++ mzvwutvl ddeb7844
+    line1 change
+    line2 right
+    line3
+    >>>>>>> conflict 1 of 1 ends
+    [EOF]
+    ");
+
+    // Run `jj fix` on the c4 commit.
+    work_dir.run_jj(["fix", "-s", "c4|c5"]).success();
+
+    // Check that the formatter was not applied to the conflicted commit as this commit
+    // is the same as the merge commit of c2 and c3.
+    let output = work_dir.run_jj(["file", "show", "foo", "-r", "c4"]);
+    insta::assert_snapshot!(output, @r"
+    <<<<<<< conflict 1 of 1
+    %%%%%%% diff from: qpvuntsm fbc9da05
+    \\\\\\\        to: kkmpptxz 6cf9e9db
+     line1
+    -line2
+    -line3
+    +line2 left
+    +line3 change
+    +++++++ mzvwutvl ddeb7844
+    line1 change
+    line2 right
+    line3
+    >>>>>>> conflict 1 of 1 ends
+    [EOF]
+    ");
+
+    // Check that the formatter was applied to the commit on top of the conflicted commit.
+    let output = work_dir.run_jj(["file", "show", "foo", "-r", "c5"]);
+    insta::assert_snapshot!(output, @r"
+    line1
+    LINE2
+    LINE3
     [EOF]
     ");
 }

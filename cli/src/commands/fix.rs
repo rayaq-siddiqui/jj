@@ -21,15 +21,15 @@ use clap_complete::ArgValueCompleter;
 use itertools::Itertools as _;
 use jj_lib::backend::FileId;
 use jj_lib::commit::Commit;
-use jj_lib::diff::RegionsToFormat;
-use jj_lib::diff::compute_changed_ranges;
-use jj_lib::diff::compute_file_line_count;
 use jj_lib::fileset;
 use jj_lib::fileset::FilesetDiagnostics;
 use jj_lib::fileset::FilesetExpression;
+use jj_lib::fix::ComputeModifiedLineRangesArgs;
 use jj_lib::fix::FileToFix;
 use jj_lib::fix::FixError;
 use jj_lib::fix::ParallelFileFixer;
+use jj_lib::fix::RegionsToFormat;
+use jj_lib::fix::compute_modified_line_ranges;
 use jj_lib::fix::fix_files;
 use jj_lib::fix::load_content_by_file_id;
 use jj_lib::matchers::Matcher;
@@ -168,7 +168,7 @@ pub(crate) struct FixArgs {
 
     /// All lines will be fixed for modified files, regardless of whether the
     /// formatter has the line-range-arg configuration specified.
-    #[arg(long, short, default_value_t = false)]
+    #[arg(long, short)]
     all_lines: bool,
 }
 
@@ -291,45 +291,29 @@ async fn fix_one_file(
             let mut extra_args = Vec::new();
 
             if let Some(line_range_arg) = &tool_config.line_range_arg {
-                let mut all_lines = all_lines_arg;
-
-                if !all_lines {
-                    if let Some(base) = &base_content {
-                        let ranges = match compute_changed_ranges(base, &prev_content) {
-                            RegionsToFormat::LineRanges(ranges) => ranges,
-                            RegionsToFormat::ByteRanges(_) => {
-                                unimplemented!("byte ranges not supported yet")
-                            }
-                        };
-
-                        // If the tool is configured to skip clean and there are no ranges to format,
-                        // we can skip the tool invocation. If skip-clean is false, we want to format
-                        // the entire file.
-                        if ranges.is_empty() && tool_config.skip_clean {
-                            return prev_content;
-                        } else if ranges.is_empty() {
-                            all_lines = true;
-                        }
-
-                        for range in ranges {
-                            extra_args.push(
-                                line_range_arg
-                                    .replace("$start", &range.start.to_string())
-                                    .replace("$end", &range.end.to_string()),
-                            );
-                        }
-                    } else {
-                        // This occurs if the file was not present in the base commit.
-                        all_lines = true;
+                let ranges = match compute_modified_line_ranges(
+                    base_content.clone(),
+                    prev_content.clone(),
+                    ComputeModifiedLineRangesArgs {
+                        all_lines: all_lines_arg,
+                        skip_unchanged_files: tool_config.skip_unchanged_files,
+                    },
+                ) {
+                    RegionsToFormat::LineRanges(ranges) => ranges,
+                    RegionsToFormat::ByteRanges(_) => {
+                        unimplemented!("byte ranges not supported yet")
                     }
+                };
+
+                if ranges.is_empty() {
+                    return prev_content;
                 }
 
-                if all_lines {
-                    let line_count = compute_file_line_count(&prev_content) + 1;
+                for range in ranges {
                     extra_args.push(
                         line_range_arg
-                            .replace("$start", "1")
-                            .replace("$end", &line_count.to_string()),
+                            .replace("$start", &range.start.to_string())
+                            .replace("$end", &range.end.to_string()),
                     );
                 }
             }
@@ -457,11 +441,11 @@ struct ToolConfig {
     enabled: bool,
     /// Arguments to pass changed line ranges to the tool.
     /// The string is a template where `$start` and `$end` are replaced by the
-    /// 1-based start and end line numbers of the changed range.
+    /// 1-based start and end inclusive line numbers of the changed range.
     /// For example, `["--lines=$start-$end"]`.
     line_range_arg: Option<String>,
-    /// Whether to skip the clean step for this tool on empty diff ranges (i.e. only deleted lines).
-    skip_clean: bool,
+    /// Whether to skip the formatting step for this tool on unchanged files.
+    skip_unchanged_files: bool,
     // TODO: Store the `name` field here and print it with the command's stderr, to clearly
     // associate any errors/warnings with the tool and its configuration entry.
 }
@@ -483,15 +467,15 @@ struct RawToolConfig {
     enabled: bool,
     #[serde(default)]
     line_range_arg: Option<String>,
-    #[serde(default = "default_tool_skip_clean")]
-    skip_clean: bool,
+    #[serde(default = "default_tool_skip_unchanged_files")]
+    skip_unchanged_files: bool,
 }
 
 fn default_tool_enabled() -> bool {
     true
 }
 
-fn default_tool_skip_clean() -> bool {
+fn default_tool_skip_unchanged_files() -> bool {
     true
 }
 
@@ -529,7 +513,7 @@ fn get_tools_config(ui: &mut Ui, settings: &UserSettings) -> Result<ToolsConfig,
                 matcher: expression.to_matcher(),
                 enabled: tool.enabled,
                 line_range_arg: tool.line_range_arg,
-                skip_clean: tool.skip_clean,
+                skip_unchanged_files: tool.skip_unchanged_files,
             })
         })
         .try_collect()?;

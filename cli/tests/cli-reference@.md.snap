@@ -1328,6 +1328,7 @@ configuration.
 
 * `-s`, `--source <REVSETS>` — Fix files in the specified revision(s) and their descendants. If no revisions are specified, this defaults to the `revsets.fix` setting, or `reachable(@, mutable())` if it is not set
 * `--include-unchanged-files` — Fix unchanged files in addition to changed ones. If no paths are specified, all files in the repo will be fixed
+* `-a`, `--all-lines` — All lines will be fixed for modified files, regardless of whether the formatter has the line-range-arg configuration specified
 
 
 

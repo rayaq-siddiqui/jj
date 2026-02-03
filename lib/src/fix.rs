@@ -15,8 +15,10 @@
 //! API for transforming file content, for example to apply formatting, and
 //! propagate those changes across revisions.
 
+use indexmap::IndexSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::mpsc::channel;
 
 use futures::StreamExt as _;
@@ -26,6 +28,8 @@ use jj_lib::backend::CommitId;
 use jj_lib::backend::FileId;
 use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
+use jj_lib::diff::ContentDiff;
+use jj_lib::diff::DiffHunkKind;
 use jj_lib::matchers::Matcher;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree::TreeDiffEntry;
@@ -272,13 +276,15 @@ pub async fn fix_files(
         }) = diff_stream.next().await
         {
             let values = values?;
-            let before = values.before.into_iter();
+            let before = values.before.into_iter().collect_vec();
             let after = values.after.into_iter();
 
             // Deleted files have no file content to fix, and they have no terms in `after`,
-            // so we don't add any files-to-fix for them. Conflicted files produce one
-            // file-to-fix for each side of the conflict.
-            for (before_term, after_term) in before.zip(after) {
+            // so we don't add any files-to-fix for them. For conflicted files in the base commit(s),
+            // we fix the first side of the conflict. For conflicted files in the current commit,
+            // we add all sides of the conflict to the files-to-fix.
+            let before_term = before.first().unwrap();
+            for after_term in after {
                 // We currently only support fixing the content of normal files, so we skip
                 // directories and symlinks, and we ignore the executable bit.
                 if let Some(TreeValue::File { id, .. }) = after_term {
@@ -377,12 +383,154 @@ pub async fn fix_files(
     Ok(summary)
 }
 
+/// Representation of different ranges formatters can use to emit diff ranges.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegionsToFormat {
+    /// Line ranges (1-based, inclusive [start, end]).
+    LineRanges(Vec<LineRange>),
+    /// Byte ranges (0-based, inclusive [start, end]).
+    ByteRanges(Vec<ByteRange>),
+}
+
+/// A formattable range of lines or bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FormatRange {
+    /// The start of the range (inclusive).
+    pub start: usize,
+    /// The end of the range (inclusive).
+    pub end: usize,
+}
+
+impl FormatRange {
+    /// Creates a new `FormatRange`.
+    pub fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+}
+
+impl From<Range<usize>> for FormatRange {
+    fn from(range: Range<usize>) -> Self {
+        Self {
+            start: range.start,
+            end: range.end - 1,
+        }
+    }
+}
+
+/// A line range (1-based, inclusive [start, end]).
+pub type LineRange = FormatRange;
+
+/// A byte range (0-based, inclusive [start, end]).
+pub type ByteRange = FormatRange;
+
+/// Computes the 1-based line or byte ranges in `current` that are different from `base`.
+/// The ranges produced can be empty.
+pub fn compute_changed_ranges(base: &[u8], current: &[u8]) -> RegionsToFormat {
+    let mut ranges: Vec<LineRange> = Vec::new();
+
+    let diff = ContentDiff::by_line([base, current]);
+    let mut current_line = 1;
+    for hunk in diff.hunks() {
+        let line_count = compute_file_line_count(hunk.contents[1]);
+        match hunk.kind {
+            DiffHunkKind::Matching => {}
+            DiffHunkKind::Different => {
+                if line_count > 0 {
+                    // We want the diff ranges to be 1-based and inclusive [start, end] as this
+                    // is what most formatters expect and is the standard used by hg.
+                    ranges.push(LineRange {
+                        start: current_line,
+                        end: current_line + line_count - 1,
+                    });
+                }
+            }
+        };
+        current_line += line_count;
+    }
+
+    RegionsToFormat::LineRanges(ranges)
+}
+
+/// Computes the number of lines in a byte slice.
+pub fn compute_file_line_count(text: &[u8]) -> usize {
+    let line_count = text.iter().filter(|&&b| b == b'\n').count();
+    let extra = if !text.is_empty() && !text.ends_with(b"\n") {
+        1
+    } else {
+        0
+    };
+    line_count + extra
+}
+
+/// Additional arguments for computing the modified line ranges between the base and current file.
+#[derive(Debug, Clone, Copy)]
+pub struct ComputeModifiedLineRangesArgs {
+    /// Whether to compute the modified line ranges for all lines.
+    pub all_lines: bool,
+    /// Whether to skip unchanged files.
+    pub skip_unchanged_files: bool,
+}
+
+impl Default for ComputeModifiedLineRangesArgs {
+    fn default() -> Self {
+        Self {
+            all_lines: false,
+            skip_unchanged_files: true,
+        }
+    }
+}
+
+/// Computes the modified line ranges between the base and current file.
+pub fn compute_modified_line_ranges(
+    base_content: Option<Vec<u8>>,
+    current_content: Vec<u8>,
+    args: ComputeModifiedLineRangesArgs,
+) -> RegionsToFormat {
+    let mut ranges = Vec::new();
+    let mut all_lines = args.all_lines;
+    if !all_lines {
+        if let Some(base) = &base_content {
+            let changed_ranges = match compute_changed_ranges(base, &current_content) {
+                RegionsToFormat::LineRanges(ranges) => ranges,
+                RegionsToFormat::ByteRanges(_) => {
+                    unimplemented!("byte ranges not supported yet")
+                }
+            };
+            // If the tool is configured to skip unchanged files and there are no ranges to format,
+            // we can skip the tool invocation. If skip-unchanged-files is false, we want to format
+            // the entire file.
+            if changed_ranges.is_empty() && args.skip_unchanged_files {
+                return RegionsToFormat::LineRanges(vec![]);
+            } else if changed_ranges.is_empty() {
+                all_lines = true;
+            } else {
+                ranges = changed_ranges;
+            }
+        } else {
+            // This occurs if the file was not present in the base commit.
+            all_lines = true;
+        }
+    }
+    if all_lines {
+        let line_count = compute_file_line_count(&current_content);
+        if line_count > 0 {
+            ranges.push(LineRange {
+                start: 1,
+                end: line_count,
+            });
+        }
+    }
+
+    RegionsToFormat::LineRanges(ranges)
+}
+
 /// Load the content of a file from the store by file_id.
 pub async fn load_content_by_file_id(
     path: &RepoPathBuf,
     file_id: &FileId,
     store: &Store,
 ) -> Result<Vec<u8>, FixError> {
+    // TODO: Consider adding a check for some max file size config or some global limit.
     let mut content = vec![];
     let mut read = store.read_file(path, file_id).await?;
     read.read_to_end(&mut content).await?;
@@ -392,22 +540,26 @@ pub async fn load_content_by_file_id(
 /// Given a vector of commits, determine the base commit(s) for each of the commits
 /// in the vector. The current commit will diff against the base commit(s) to determine
 /// the modified files that need to be `jj fix`ed.
-pub fn get_base_commit_map(commits: &[Commit]) -> HashMap<CommitId, HashSet<CommitId>> {
-    let base_commits: Vec<Commit> = commits
+pub fn get_base_commit_map(commits: &[Commit]) -> HashMap<CommitId, IndexSet<CommitId>> {
+    let base_commits = commits
         .iter()
         .flat_map(|commit| commit.parents().collect::<Result<Vec<_>, _>>().unwrap())
         .filter(|commit| !commits.contains(commit))
-        .collect();
+        .collect_vec();
     let base_commit_ids: HashSet<CommitId> = base_commits
         .iter()
         .map(|commit| commit.id().clone())
         .collect();
 
-    // Build a map of commit IDs to a set of their base commit IDs.
-    let mut base_commit_map: HashMap<CommitId, HashSet<CommitId>> = HashMap::new();
+    // Build a map of each commit to its "base commits" (closest ancestors not in `commits`).
+    //
+    // We process commits in topological order (parents before children) so that
+    // we can propagate the base commits from parents to children. Note that the
+    // `commits` vector is in reverse topological order, so we iterate in reverse.
+    let mut base_commit_map: HashMap<CommitId, IndexSet<CommitId>> = HashMap::new();
     for commit in commits.iter().rev() {
         let commit_id = commit.id().clone();
-        let mut parent_commit_ids: HashSet<CommitId> = HashSet::new();
+        let mut parent_commit_ids: IndexSet<CommitId> = IndexSet::new();
 
         for parent in commit.parents() {
             match parent {

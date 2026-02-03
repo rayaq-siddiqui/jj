@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use indexmap::IndexSet;
+use jj_lib::fix::ComputeModifiedLineRangesArgs;
+use jj_lib::fix::compute_modified_line_ranges;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -23,6 +26,9 @@ use jj_lib::fix::FileKey;
 use jj_lib::fix::FileToFix;
 use jj_lib::fix::FixError;
 use jj_lib::fix::ParallelFileFixer;
+use jj_lib::fix::RegionsToFormat;
+use jj_lib::fix::compute_changed_ranges;
+use jj_lib::fix::compute_file_line_count;
 use jj_lib::fix::fix_files;
 use jj_lib::fix::get_base_commit_map;
 use jj_lib::matchers::EverythingMatcher;
@@ -549,13 +555,13 @@ fn test_get_base_commit_map_chain() {
 
     // We have a chain of commits.
     //
-    // A (root)
-    // |
-    // B
+    // D
     // |
     // C
     // |
-    // D
+    // B
+    // |
+    // A (root)
     let mut tx = repo.start_transaction();
     let path = repo_path("file1");
     let tree1 = create_tree(repo, &[(path, "commit 1: content")]);
@@ -575,8 +581,8 @@ fn test_get_base_commit_map_chain() {
     let commits: Vec<Commit> = vec![commit_d_obj, commit_c_obj, commit_b_obj];
     let base_commit_map = get_base_commit_map(&commits);
 
-    let parents_set = HashSet::from([commit_a]);
-    let expected_base_commit_map: HashMap<CommitId, HashSet<CommitId>> = HashMap::from([
+    let parents_set = IndexSet::from([commit_a]);
+    let expected_base_commit_map: HashMap<CommitId, IndexSet<CommitId>> = HashMap::from([
         (commit_d, parents_set.clone()),
         (commit_c, parents_set.clone()),
         (commit_b, parents_set.clone()),
@@ -591,12 +597,11 @@ fn test_get_base_commit_map_merge() {
     let repo = &test_repo.repo;
 
     // We have a merge of commits
-    //
-    //   A   B (roots)
-    //   | / |
-    //   C   D
-    //    \ /
     //     E
+    //    / \
+    //   C   D
+    //   | \ |
+    //   A   B (roots)
     let mut tx = repo.start_transaction();
     let path = repo_path("file1");
     let tree1 = create_tree(repo, &[(path, "commit 1: content")]);
@@ -617,14 +622,14 @@ fn test_get_base_commit_map_merge() {
     let base_commit_map = get_base_commit_map(&commits);
 
     // Should be {e: {a, b, d}, c: {a, b}}
-    let expected_base_commit_map: HashMap<CommitId, HashSet<CommitId>> = HashMap::from([
+    let expected_base_commit_map: HashMap<CommitId, IndexSet<CommitId>> = HashMap::from([
         (
             commit_e,
-            HashSet::from([commit_a.clone(), commit_b.clone(), commit_d.clone()]),
+            IndexSet::from([commit_a.clone(), commit_b.clone(), commit_d.clone()]),
         ),
         (
             commit_c,
-            HashSet::from([commit_a.clone(), commit_b.clone()]),
+            IndexSet::from([commit_a.clone(), commit_b.clone()]),
         ),
     ]);
 
@@ -652,4 +657,201 @@ fn test_load_content_by_file_id() {
         .block_on()
         .unwrap();
     assert_eq!(content, b"commit 1: content");
+}
+
+#[test]
+fn test_compute_changed_line_ranges() {
+    // Insert & Delete & Modify.
+    assert_eq!(
+        compute_changed_ranges(b"a\n", b"a\nb\n"),
+        RegionsToFormat::LineRanges(vec![(2..3).into()])
+    );
+    assert_eq!(
+        compute_changed_ranges(b"a\nb\nc\n", b"a\nc\n"),
+        RegionsToFormat::LineRanges(vec![])
+    );
+    assert_eq!(
+        compute_changed_ranges(b"a\nb\nc\n", b"a\nB\nc\n"),
+        RegionsToFormat::LineRanges(vec![(2..3).into()])
+    );
+
+    // Modify multiple & Insert at start.
+    assert_eq!(
+        compute_changed_ranges(b"a\nb\nc\n", b"a\nB\nC\n"),
+        RegionsToFormat::LineRanges(vec![(2..4).into()])
+    );
+    assert_eq!(
+        compute_changed_ranges(b"a\n", b"new\na\n"),
+        RegionsToFormat::LineRanges(vec![(1..2).into()])
+    );
+
+    // Inserting new line at EOF & Insert at EOF but no newline.
+    assert_eq!(
+        compute_changed_ranges(b"a", b"a\n"),
+        RegionsToFormat::LineRanges(vec![(1..2).into()])
+    );
+    assert_eq!(
+        compute_changed_ranges(b"a\n", b"a\nb"),
+        RegionsToFormat::LineRanges(vec![(2..3).into()])
+    );
+
+    // Complex case with multiple modifications and insertions.
+    assert_eq!(
+        compute_changed_ranges(b"a\nb\nc\nd\ne\nf\n", b"a\nB\nC\nd\ne\nF\n"),
+        RegionsToFormat::LineRanges(vec![(2..4).into(), (6..7).into()])
+    );
+}
+
+#[test]
+fn test_compute_file_line_count() {
+    assert_eq!(compute_file_line_count(b""), 0);
+    assert_eq!(compute_file_line_count(b"a"), 1);
+    assert_eq!(compute_file_line_count(b"a\n"), 1);
+    assert_eq!(compute_file_line_count(b"a\nb"), 2);
+    assert_eq!(compute_file_line_count(b"a\nb\n"), 2);
+}
+
+// TODO: write tests for `compute_modified_line_ranges`
+#[test]
+fn test_compute_modified_line_ranges_default() {
+    let compute_modified_line_ranges_arg = ComputeModifiedLineRangesArgs::default();
+    let current_content = b"a\nb\nc\n".to_vec();
+
+    // Base content None.
+    assert_eq!(
+        compute_modified_line_ranges(
+            None,
+            current_content.clone(),
+            compute_modified_line_ranges_arg
+        ),
+        RegionsToFormat::LineRanges(vec![(1..4).into()])
+    );
+
+    // Empty base content.
+    assert_eq!(
+        compute_modified_line_ranges(
+            Some(b"".to_vec()),
+            current_content.clone(),
+            compute_modified_line_ranges_arg
+        ),
+        RegionsToFormat::LineRanges(vec![(1..4).into()])
+    );
+
+    // Modified base content.
+    assert_eq!(
+        compute_modified_line_ranges(
+            Some(b"a\nB\nc\n".to_vec()),
+            current_content.clone(),
+            compute_modified_line_ranges_arg
+        ),
+        RegionsToFormat::LineRanges(vec![(2..3).into()])
+    );
+
+    // Deleted base content.
+    assert_eq!(
+        compute_modified_line_ranges(
+            Some(b"a\nb\nc\nd\n".to_vec()),
+            current_content.clone(),
+            compute_modified_line_ranges_arg
+        ),
+        RegionsToFormat::LineRanges(vec![])
+    );
+
+    // Multiple line ranges.
+    assert_eq!(
+        compute_modified_line_ranges(
+            Some(b"A\nb\nC\n".to_vec()),
+            current_content.clone(),
+            compute_modified_line_ranges_arg
+        ),
+        RegionsToFormat::LineRanges(vec![(1..2).into(), (3..4).into()])
+    );
+
+    // Deleted current content.
+    assert_eq!(
+        compute_modified_line_ranges(
+            Some(current_content.clone()),
+            b"".to_vec(),
+            compute_modified_line_ranges_arg
+        ),
+        RegionsToFormat::LineRanges(vec![])
+    );
+}
+
+#[test]
+fn test_compute_modified_line_ranges_all_lines() {
+    let compute_modified_line_ranges_arg = ComputeModifiedLineRangesArgs {
+        all_lines: true,
+        skip_unchanged_files: true,
+    };
+    let current_content = b"a\nb\nc\n".to_vec();
+
+    // Empty base content.
+    assert_eq!(
+        compute_modified_line_ranges(
+            Some(b"".to_vec()),
+            current_content.clone(),
+            compute_modified_line_ranges_arg
+        ),
+        RegionsToFormat::LineRanges(vec![(1..4).into()])
+    );
+
+    // Modified base content.
+    assert_eq!(
+        compute_modified_line_ranges(
+            Some(b"a\nB\nc\n".to_vec()),
+            current_content.clone(),
+            compute_modified_line_ranges_arg
+        ),
+        RegionsToFormat::LineRanges(vec![(1..4).into()])
+    );
+
+    // Deleted base content.
+    assert_eq!(
+        compute_modified_line_ranges(
+            Some(b"a\nb\nc\nd\n".to_vec()),
+            current_content.clone(),
+            compute_modified_line_ranges_arg
+        ),
+        RegionsToFormat::LineRanges(vec![(1..4).into()])
+    );
+
+    // Deleted current content.
+    assert_eq!(
+        compute_modified_line_ranges(
+            Some(current_content.clone()),
+            b"".to_vec(),
+            compute_modified_line_ranges_arg
+        ),
+        RegionsToFormat::LineRanges(vec![])
+    );
+}
+
+#[test]
+fn test_compute_modified_line_ranges_skip_unchanged_files() {
+    let compute_modified_line_ranges_arg = ComputeModifiedLineRangesArgs {
+        all_lines: false,
+        skip_unchanged_files: false,
+    };
+    let current_content = b"a\nb\nc\n".to_vec();
+
+    // Deleted base content.
+    assert_eq!(
+        compute_modified_line_ranges(
+            Some(b"a\nb\nc\nd\n".to_vec()),
+            current_content.clone(),
+            compute_modified_line_ranges_arg
+        ),
+        RegionsToFormat::LineRanges(vec![(1..4).into()])
+    );
+
+    // Deleted current content.
+    assert_eq!(
+        compute_modified_line_ranges(
+            Some(current_content.clone()),
+            b"".to_vec(),
+            compute_modified_line_ranges_arg
+        ),
+        RegionsToFormat::LineRanges(vec![])
+    );
 }
